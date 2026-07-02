@@ -1,0 +1,218 @@
+import { useEffect, useRef, useState } from "react";
+import { askQuestion, uploadFiles } from "../api/ragApi";
+import { CloseIcon, FileIcon, PlusIcon, SendIcon } from "./Icons";
+import type { DocumentEntry } from "./Sidebar";
+
+interface Message {
+  role: "user" | "assistant";
+  content: string;
+  sources?: { filename: string; score: number }[];
+}
+
+interface ChatBoxProps {
+  sessionId: string;
+  onDocumentsIndexed: (documents: DocumentEntry[]) => void;
+}
+
+const MAX_FILES = 5;
+const MAX_PAGES = 500;
+
+export default function ChatBox({ sessionId, onDocumentsIndexed }: ChatBoxProps) {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState("");
+  const [pendingFiles, setPendingFiles] = useState<File[]>([]);
+  const [isSending, setIsSending] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages, isSending]);
+
+  const handleAttachClick = () => fileInputRef.current?.click();
+
+  const handleFilesSelected = (fileList: FileList | null) => {
+    if (!fileList) return;
+    const incoming = Array.from(fileList).filter((f) => f.type === "application/pdf");
+    const combined = [...pendingFiles, ...incoming].slice(0, MAX_FILES);
+    setPendingFiles(combined);
+    setUploadError(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const removePendingFile = (name: string) => {
+    setPendingFiles((prev) => prev.filter((f) => f.name !== name));
+  };
+
+  const runUpload = async (): Promise<boolean> => {
+    if (pendingFiles.length === 0) return true;
+    setIsUploading(true);
+    setUploadError(null);
+    try {
+      const result = await uploadFiles(pendingFiles, sessionId);
+      onDocumentsIndexed(
+        result.files.map((f) => ({
+          filename: f.filename,
+          chunks: f.totalChunks,
+        }))
+      );
+      setPendingFiles([]);
+      return true;
+    } catch (err) {
+      console.error(err);
+      const message = err instanceof Error ? err.message : "L'indexation des documents a echoue.";
+      setUploadError(message);
+      return false;
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const handleSend = async () => {
+    const question = input.trim();
+    if (!question && pendingFiles.length === 0) return;
+    if (isSending || isUploading) return;
+
+    if (pendingFiles.length > 0) {
+      const ok = await runUpload();
+      if (!ok) return;
+    }
+
+    if (!question) return;
+
+    setMessages((prev) => [...prev, { role: "user", content: question }]);
+    setInput("");
+    if (textareaRef.current) textareaRef.current.style.height = "auto";
+    setIsSending(true);
+
+    try {
+      const result = await askQuestion(question, sessionId);
+      setMessages((prev) => [...prev, { role: "assistant", content: result.answer, sources: result.sources }]);
+    } catch (err) {
+      console.error(err);
+      const message = err instanceof Error ? err.message : "Une erreur est survenue pendant la generation de la reponse.";
+      setMessages((prev) => [...prev, { role: "assistant", content: message }]);
+    } finally {
+      setIsSending(false);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setInput(e.target.value);
+    const el = e.target;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  };
+
+  const canSend = (input.trim().length > 0 || pendingFiles.length > 0) && !isSending && !isUploading;
+
+  return (
+    <div className="chat">
+      <div className="chat__messages" ref={scrollRef}>
+        {messages.length === 0 && (
+          <div className="chat__empty-state">
+            <h2>Posez une question sur vos documents</h2>
+            <p>
+              Ajoutez jusqu'a {MAX_FILES} PDF ({MAX_PAGES} pages cumulees max) avec le bouton "+", puis interrogez-les
+              directement dans la conversation.
+            </p>
+          </div>
+        )}
+
+        {messages.map((msg, i) => (
+          <div className={`message message--${msg.role}`} key={i}>
+            <div className="message__bubble">{msg.content}</div>
+            {msg.sources && msg.sources.length > 0 && (
+              <div className="message__sources">
+                Sources : {msg.sources.map((s) => s.filename).join(", ")}
+              </div>
+            )}
+          </div>
+        ))}
+
+        {isSending && (
+          <div className="message message--assistant">
+            <div className="message__bubble message__bubble--typing">
+              <span className="typing-dot" />
+              <span className="typing-dot" />
+              <span className="typing-dot" />
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="composer">
+        {pendingFiles.length > 0 && (
+          <div className="composer__attachments">
+            {pendingFiles.map((file) => (
+              <div className="attachment-chip" key={file.name}>
+                <FileIcon size={14} />
+                <span className="attachment-chip__name">{file.name}</span>
+                <button
+                  className="attachment-chip__remove"
+                  onClick={() => removePendingFile(file.name)}
+                  aria-label={`Retirer ${file.name}`}
+                >
+                  <CloseIcon size={12} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {uploadError && <div className="composer__error">{uploadError}</div>}
+
+        <div className="composer__input-row">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/pdf"
+            multiple
+            hidden
+            onChange={(e) => handleFilesSelected(e.target.files)}
+          />
+
+          <button
+            className="icon-button composer__attach"
+            onClick={handleAttachClick}
+            disabled={pendingFiles.length >= MAX_FILES}
+            aria-label="Joindre des PDF"
+            title="Joindre des PDF"
+          >
+            <PlusIcon />
+          </button>
+
+          <textarea
+            ref={textareaRef}
+            className="composer__textarea"
+            placeholder="Posez votre question ou joignez un PDF..."
+            value={input}
+            onChange={handleTextareaChange}
+            onKeyDown={handleKeyDown}
+            rows={1}
+          />
+
+          <button
+            className="composer__send"
+            onClick={handleSend}
+            disabled={!canSend}
+            aria-label="Envoyer"
+          >
+            <SendIcon />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
