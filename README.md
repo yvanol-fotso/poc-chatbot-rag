@@ -56,7 +56,7 @@ cd backend
 npm install
 ```
 
-Crée un fichier `.env` à la racine de `backend/` avec ta clé Groq :
+lire la variable de .env.example et creer le fichier `.env` à la racine de `backend/` avec  la clé Groq fourni :
 
 ```
 GROQ_API_KEY=ta_cle_groq_ici
