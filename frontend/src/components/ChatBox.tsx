@@ -191,7 +191,7 @@ export default function ChatBox({ sessionId, initialMessages = [], onDocumentsIn
           <textarea
             ref={textareaRef}
             className="composer__textarea"
-            placeholder="Posez votre question ou joignez un PDF..."
+            placeholder="Posez votre question..."
             value={input}
             onChange={handleTextareaChange}
             onKeyDown={handleKeyDown}
