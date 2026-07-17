@@ -1,22 +1,18 @@
 import Groq from "groq-sdk";
 import { callGroqWithLimit } from "../groqLimiter";
+import {
+  extractionResultSchema,
+  entitiesArraySchema,
+  relationsArraySchema,
+  ValidatedEntity,
+  ValidatedRelation,
+} from "./graphSchema";
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-export interface ExtractedEntity {
-  name: string;
-  type: string;
-}
-
-export interface ExtractedRelation {
-  source: string;
-  relation: string;
-  target: string;
-}
-
 export interface ExtractionResult {
-  entities: ExtractedEntity[];
-  relations: ExtractedRelation[];
+  entities: ValidatedEntity[];
+  relations: ValidatedRelation[];
 }
 
 const EXTRACTION_SYSTEM_PROMPT = `Tu es un moteur d'extraction d'entités et de relations pour un graphe de connaissances.
@@ -39,6 +35,8 @@ Règles :
 export async function extractEntitiesAndRelations(
   chunkText: string
 ): Promise<ExtractionResult> {
+  let rawParsed: unknown;
+
   try {
     const completion = await callGroqWithLimit(
       () =>
@@ -55,15 +53,53 @@ export async function extractEntitiesAndRelations(
     );
 
     const raw = completion.choices[0]?.message?.content ?? "{}";
-    const parsed = JSON.parse(raw);
-
-    return {
-      entities: Array.isArray(parsed.entities) ? parsed.entities : [],
-      relations: Array.isArray(parsed.relations) ? parsed.relations : [],
-    };
+    rawParsed = JSON.parse(raw);
   } catch (error) {
-    // on arrive ici seulement après épuisement des 3 tentatives (ou erreur définitive)
-    console.error("Erreur définitive d'extraction pour ce chunk :", error);
+    // échec réseau/LLM après épuisement des retries, ou JSON illisible
+    console.error("[graph-extraction] Échec de l'appel LLM ou JSON invalide :", error);
     return { entities: [], relations: [] };
   }
+
+  // Validation stricte via Zod. safeParse plutôt que parse : on ne veut jamais
+  // qu'une erreur de validation fasse planter le worker, juste qu'elle soit loggée
+  // et qu'on retombe sur un résultat vide pour ce chunk.
+  const validation = extractionResultSchema.safeParse(rawParsed);
+
+  if (!validation.success) {
+    console.warn(
+      "[graph-extraction] JSON structurellement invalide, filtrage entité par entité en repli :",
+      validation.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(" | ")
+    );
+    return filterValidItemsManually(rawParsed);
+  }
+
+  return validation.data;
+}
+
+/**
+ * Filet de sécurité : si la structure globale échoue (ex: "entities" n'est pas un tableau
+ * à cause d'une hallucination de format par le LLM), on tente quand même de récupérer
+ * les entités/relations individuellement valides plutôt que de tout jeter.
+ */
+
+function filterValidItemsManually(rawParsed: unknown): ExtractionResult {
+  const obj = rawParsed as { entities?: unknown[]; relations?: unknown[] };
+
+  const entities: ValidatedEntity[] = [];
+  if (Array.isArray(obj?.entities)) {
+    for (const item of obj.entities) {
+      const parsed = entitiesArraySchema.element.safeParse(item);
+      if (parsed.success) entities.push(parsed.data);
+    }
+  }
+
+  const relations: ValidatedRelation[] = [];
+  if (Array.isArray(obj?.relations)) {
+    for (const item of obj.relations) {
+      const parsed = relationsArraySchema.element.safeParse(item);
+      if (parsed.success) relations.push(parsed.data);
+    }
+  }
+
+  return { entities, relations };
 }

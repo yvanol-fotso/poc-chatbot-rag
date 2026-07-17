@@ -33,5 +33,25 @@ export async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_documents_session_id ON documents(session_id);
   `);
 
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS indexing_jobs (
+      id SERIAL PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      filename TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', -- pending | processing | completed | failed
+      total_chunks INTEGER NOT NULL DEFAULT 0,
+      processed_chunks INTEGER NOT NULL DEFAULT 0,
+      failed_chunks INTEGER NOT NULL DEFAULT 0,
+      error_message TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_indexing_jobs_session_id ON indexing_jobs(session_id);
+  `);
+
   console.log("Base de données initialisée");
 }

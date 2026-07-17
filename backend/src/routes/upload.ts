@@ -5,6 +5,8 @@ import { extractTextFromPDF } from "../services/pdfLoader";
 import { chunkText } from "../services/chunker";
 import { embedText } from "../services/embeddings";
 import { addToStore, getStoreSize } from "../services/vectorStore";
+import { createJob } from "../services/jobStore";
+import { enqueueGraphIngestion } from "../queue/graphQueue";
 import { pool } from "../services/db";
 import pdfParse from "pdf-parse";
 import fs from "fs";
@@ -27,19 +29,16 @@ const MAX_TOTAL_PAGES = 500;
 
 router.post("/upload", upload.array("files", MAX_FILES), async (req, res) => {
   const files = req.files as Express.Multer.File[];
-  const sessionId = req.body.sessionId; // nouveau send par le frontend
+  const sessionId = req.body.sessionId;
 
   if (!files || files.length === 0) {
     return res.status(400).json({ error: "Aucun fichier reçu" });
   }
-
   if (!sessionId) {
     return res.status(400).json({ error: "Le champ 'sessionId' est requis" });
   }
 
   try {
-
-    // check  le nombre total de pages avant de tout traiter
     let totalPages = 0;
     const pageCounts: { filename: string; pages: number }[] = [];
 
@@ -57,8 +56,8 @@ router.post("/upload", upload.array("files", MAX_FILES), async (req, res) => {
       });
     }
 
-    // phase 2 Traite chaque fichier  extraction -> chunking -> embeddings -> stockage
     const results = [];
+    const useGraph = process.env.RAG_STRATEGY === "graph";
 
     for (const file of files) {
       const text = await extractTextFromPDF(file.path);
@@ -73,13 +72,25 @@ router.post("/upload", upload.array("files", MAX_FILES), async (req, res) => {
           ...chunk,
           embedding,
           filename: file.filename,
-          sessionId, 
+          sessionId,
         });
       }
 
+      // le vector store reste synchrone : c'est rapide (pas d'appel LLM), pas besoin de file d'attente ici
       await addToStore(chunksWithEmbeddings);
 
-      // new pr garder une trace du document en base pour pouvoir l'afficher plus tard
+      // l'ingestion graphe, elle, part en arrière-plan
+      let jobId: number | null = null;
+      if (useGraph) {
+        jobId = await createJob(sessionId, file.filename, chunksWithEmbeddings.length);
+        await enqueueGraphIngestion({
+          jobId,
+          sessionId,
+          filename: file.filename,
+          chunks: chunksWithEmbeddings.map((c) => ({ content: c.content })),
+        });
+      }
+
       await pool.query(
         `INSERT INTO documents (session_id, filename, chunks) VALUES ($1, $2, $3)`,
         [sessionId, file.filename, chunks.length]
@@ -88,6 +99,7 @@ router.post("/upload", upload.array("files", MAX_FILES), async (req, res) => {
       results.push({
         filename: file.filename,
         totalChunks: chunks.length,
+        graphJobId: jobId,
       });
     }
 
@@ -96,6 +108,7 @@ router.post("/upload", upload.array("files", MAX_FILES), async (req, res) => {
       totalPages,
       files: results,
       totalStored: await getStoreSize(),
+      graphIngestion: useGraph,
     });
   } catch (error) {
     console.error(error);
