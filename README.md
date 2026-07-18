@@ -1,13 +1,13 @@
-# POC Chatbot RAG
+# Insightly Docs
 
-Proof of Concept du chatbot RAG permettant d'uploader des documents PDF (1 à 5 fichiers, 500 pages cumulées max) et de poser des questions dessus en langage naturel.
+Assistant documentaire intelligent permettant d'uploader des documents PDF et de les interroger en langage naturel, avec deux moteurs de recherche interchangeables : un **RAG vectoriel classique (Naive)** et un **RAG par graphe de connaissances (GraphRAG)**.
 
-##  Démo en ligne
+## 🌐 Démo en ligne
 
 - **Frontend** : [https://poc-chatbot-rag.vercel.app](https://poc-chatbot-rag.vercel.app)
 - **Backend (API)** : [https://poc-chatbot-rag.onrender.com](https://poc-chatbot-rag.onrender.com)
 
->  Le backend est hébergé sur le plan gratuit de Render, qui met le service en veille après quelques minutes d'inactivité. Le premier appel après une période d'inactivité peut donc prendre 30 à 60 secondes le temps que le service redémarre.
+> Le backend est hébergé sur le plan gratuit de Render, qui met le service en veille après quelques minutes d'inactivité. Le premier appel après une période d'inactivité peut donc prendre 30 à 60 secondes le temps que le service redémarre.
 
 ## Stack technique
 
@@ -16,219 +16,222 @@ Proof of Concept du chatbot RAG permettant d'uploader des documents PDF (1 à 5 
 | Backend | Node.js / TypeScript, Express | Node.js / TypeScript, Express — [Render](https://render.com) |
 | Frontend | React (Vite) / TypeScript | React (Vite) / TypeScript — [Vercel](https://vercel.com) |
 | Embeddings | `@xenova/transformers` (`Xenova/all-MiniLM-L6-v2`, local, gratuit) | Identique |
-| Vector Database | [Chroma](https://www.trychroma.com/) (persistance sur disque local) | [Qdrant Cloud](https://qdrant.tech/) |
-| Base de données | PostgreSQL local | [Neon](https://neon.tech) (PostgreSQL serverless, gratuit) |
-| LLM | Groq (modèle `llama-3.3-70b-versatile`, gratuit) | Identique |
+| Vector Database | [Chroma](https://www.trychroma.com/) (disque local) | [Qdrant Cloud](https://qdrant.tech/) |
+| Graphe de connaissances | [Neo4j](https://neo4j.com/) local ou Aura | Neo4j Aura (managé) |
+| File d'attente | Redis local + [BullMQ](https://docs.bullmq.io/) | Redis managé (ex: Upstash) + BullMQ |
+| Base de données relationnelle | PostgreSQL local | [Neon](https://neon.tech) (PostgreSQL serverless, gratuit) |
+| LLM | Groq (`llama-3.3-70b-versatile`, gratuit) | Identique |
 
-Le projet est conçu pour tourner **soit en local avec Chroma, soit en production avec Qdrant**, sans aucune modification de code : le backend bascule automatiquement entre les deux selon la présence de la variable d'environnement `QDRANT_URL` (voir la section [Configuration du vector store](#configuration-du-vector-store)).
+Le vector store bascule automatiquement entre Chroma (local) et Qdrant (production) selon la présence de `QDRANT_URL` — aucune modification de code nécessaire pour changer d'environnement.
 
-## Fonctionnalités
+## Les deux moteurs RAG
 
-- Upload de plusieurs PDF (1 à 5, max 500 pages cumulées)
-- Extraction et nettoyage du texte
-- Découpage en chunks avec chevauchement (overlap)
-- Génération d'embeddings locaux
-- Stockage vectoriel persistant (Chroma en local, Qdrant Cloud en production), scopé par conversation (`sessionId`)
-- Recherche par similarité (retrieval)
-- Génération de réponse contextualisée via LLM (Groq)
-- Historique de conversation persistant par session, navigable depuis la sidebar
-- Chaque conversation garde son propre lot de documents indexés
+### Naive RAG
+Pipeline classique : recherche vectorielle par similarité (Chroma/Qdrant) → injection du contexte dans le prompt → génération de réponse par le LLM. Rapide, simple, efficace pour la majorité des questions ponctuelles.
 
-> **Historique de conversation et documents**
->
-> L'historique des messages ainsi que la liste des documents indexés par conversation sont stockés dans PostgreSQL (tables `messages` et `documents`, associées par `session_id`). Cela permet de retrouver et recharger une conversation passée, avec ses documents, même après un redémarrage du serveur.
->
-> Les vecteurs d'embeddings restent stockés séparément (Chroma ou Qdrant selon l'environnement), filtrés eux aussi par `sessionId` afin que chaque conversation n'interroge que ses propres documents.
+### GraphRAG
+Construit un **graphe de connaissances** (entités + relations) à partir des documents, stocké dans Neo4j. Permet de répondre à des questions qui s'appuient sur les relations entre concepts plutôt que sur la seule similarité textuelle. Ce mode est plus lent à l'ingestion mais plus riche à l'interrogation.
 
-## Configuration du vector store
+Le choix du moteur se fait par requête (`ragStrategy: "naive" | "graph"`), avec repli sur la variable d'environnement `RAG_STRATEGY` si rien n'est précisé.
 
-Le backend détecte automatiquement quel vector store utiliser :
+## Le pipeline GraphRAG en détail — conçu pour la production
 
-- Si la variable d'environnement `QDRANT_URL` **n'est pas définie** → utilisation de **Chroma en local** (`http://localhost:8000`)
-- Si `QDRANT_URL` **est définie** → utilisation de **Qdrant Cloud**
+L'ingestion GraphRAG est bâtie comme un pipeline robuste, pas un prototype : chaque étape a été ajoutée pour résoudre un problème concret de fiabilité à l'échelle.
 
-Cette bascule est gérée dans `backend/src/services/vectorStore.ts`, qui redirige vers `vectorStore.chroma.ts` ou `vectorStore.qdrant.ts` selon le cas. Aucun autre fichier du projet n'a besoin d'être modifié.
+1. **File d'attente asynchrone** (BullMQ + Redis) — l'upload répond immédiatement ; l'extraction d'entités/relations tourne en arrière-plan, avec un statut consultable en temps réel (`processed_chunks / total_chunks`) via `GET /api/indexing-status/:sessionId`.
+2. **Rate limiting + backoff exponentiel** sur les appels Groq — concurrence plafonnée, retry automatique avec attente croissante en cas de `429`, abandon immédiat sur les erreurs définitives (pas de retry inutile).
+3. **Validation de schéma (Zod)** — tout JSON retourné par le LLM est validé avant d'atteindre Neo4j ; une entité individuellement invalide est filtrée sans faire échouer tout le chunk.
+4. **Normalisation des entités** — les noms sont fusionnés par une clé normalisée (minuscules, sans accents, sans article), pour éviter que "Réducteur" / "réducteur" / "le réducteur" ne créent des nœuds distincts, tout en conservant un nom d'affichage propre.
+5. **Batching des chunks** — plusieurs chunks sont regroupés par appel LLM (au lieu d'un appel par chunk), ce qui réduit le nombre de requêtes d'environ 80 % pour un document typique.
+6. **Statut d'indexation visible** — le frontend affiche une barre de progression en temps réel pendant l'indexation graphe, avec remontée claire des échecs éventuels.
+
+### Chantier à venir : détection de communautés
+Une fois le graphe construit, l'étape suivante consiste à appliquer un algorithme de clustering (type Leiden) pour regrouper les entités en communautés thématiques et générer un résumé par communauté — ce qui permettra de répondre à des questions globales ("quels sont les grands thèmes de ce document ?"), pas uniquement des questions ciblées sur une entité précise. Cette fonctionnalité n'est pas encore implémentée.
 
 ## Prérequis
 
-### Pour un lancement en local (Chroma)
+### Pour un lancement en local
 
 - Node.js (v18+)
-- Python (pour faire tourner Chroma)
-- PostgreSQL (v14+) — ou un compte [Neon](https://neon.tech) gratuit
+- Python (pour Chroma, si utilisé en mode Naive)
+- PostgreSQL (v14+) ou un compte [Neon](https://neon.tech) gratuit
+- Redis (local via Docker, ou managé)
+- Neo4j (local via Docker/Desktop, ou [Aura](https://neo4j.com/cloud/aura/) gratuit) — requis uniquement pour le mode GraphRAG
 - Une clé API [Groq](https://console.groq.com) (gratuite)
 
-### Pour un déploiement en production (Qdrant)
+### Pour un déploiement en production
 
-- Un compte [Qdrant Cloud](https://cloud.qdrant.io) (gratuit)
-- Un compte [Neon](https://neon.tech) (PostgreSQL serverless, gratuit)
-- Un compte [Render](https://render.com) (backend, gratuit)
-- Un compte [Vercel](https://vercel.com) (frontend, gratuit)
+- [Qdrant Cloud](https://cloud.qdrant.io) (gratuit)
+- [Neon](https://neon.tech) (PostgreSQL serverless, gratuit)
+- Redis managé (ex: [Upstash](https://upstash.com), gratuit)
+- [Neo4j Aura](https://neo4j.com/cloud/aura/) (gratuit) — pour le mode GraphRAG
+- [Render](https://render.com) (backend, gratuit)
+- [Vercel](https://vercel.com) (frontend, gratuit)
 - Une clé API [Groq](https://console.groq.com) (gratuite)
 
-## Installation en local (avec Chroma)
+## Installation en local
 
 ### 1. Cloner le projet
 
 ```bash
 git clone <url-du-repo>
-cd poc-chatbot-rag
+cd insightly-docs
 ```
 
-### 2. Installer et lancer Chroma (base vectorielle)
+### 2. Services annexes
 
 ```bash
+# Chroma (mode Naive)
 pip install chromadb
 chroma run --path ./chroma_data
+
+# Redis (nécessaire au mode Graph)
+docker run -d --name redis -p 6379:6379 redis:7-alpine
+
+# Neo4j (nécessaire au mode Graph)
+docker run -d --name neo4j -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/motdepasse neo4j:5
 ```
 
-Laisse ce terminal ouvert. Chroma tourne sur `http://localhost:8000`.
-
-### 3. Configurer PostgreSQL
-
-Crée la base de données
+### 3. PostgreSQL
 
 ```bash
 psql -U postgres
 ```
-
-Puis dans `psql` :
-
 ```sql
 CREATE DATABASE rag_poc;
 ```
+Les tables (`messages`, `documents`, `indexing_jobs`) sont créées automatiquement au démarrage du backend.
 
-La table `messages` et la table `documents` sont créées automatiquement au démarrage du backend si elles n'existent pas.
-
-### 4. Configurer et lancer le backend
+### 4. Backend
 
 ```bash
 cd backend
 npm install
 ```
 
-Puis lire la variable de `.env.example` et créer le fichier `.env` à la racine de `backend/` :
+Crée `backend/.env` :
 
 ```
 GROQ_API_KEY=groq_xxxxx
-DATABASE_URL=postgresql://postgres:ton_mot_de_passe@localhost:5432/rag_poc
+DATABASE_URL=postgresql://postgres:motdepasse@localhost:5432/rag_poc
+
+# Mode RAG par défaut : "naive" ou "graph"
+RAG_STRATEGY=naive
+
+# Requis uniquement en mode graph :
+REDIS_URL=redis://localhost:6379
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=motdepasse
+
+# Laisser vide en local pour utiliser Chroma automatiquement :
+# QDRANT_URL=
+# QDRANT_API_KEY=
 ```
-
-Ne pas définir `QDRANT_URL` ni `QDRANT_API_KEY` en local - leur absence est ce qui déclenche automatiquement l'utilisation de Chroma.
-
-Lance le serveur
 
 ```bash
 npm run dev
 ```
-
 Le backend tourne sur `http://localhost:3000`.
 
-### 5. Lancer le frontend
-
-Dans un nouveau terminal :
+### 5. Frontend
 
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
-
 Le frontend tourne sur `http://localhost:5173`.
 
-## Déploiement en production (avec Qdrant, Neon, Render, Vercel)
+## Déploiement en production
 
-### 1. Base de données — Neon
+### Base de données — Neon
+Crée un projet et une base `rag_poc` sur [neon.tech](https://neon.tech), récupère `DATABASE_URL`.
 
-1. Crée un compte sur [neon.tech](https://neon.tech)
-2. Crée un projet et une base de données (ex: `rag_poc`)
-3. Récupère l'URL de connexion (`DATABASE_URL`)
+### Vector store — Qdrant Cloud
+Crée un cluster sur [cloud.qdrant.io](https://cloud.qdrant.io), récupère `QDRANT_URL` et `QDRANT_API_KEY`.
 
-### 2. Vector store — Qdrant Cloud
+### Graphe — Neo4j Aura
+Crée une instance sur [neo4j.com/cloud/aura](https://neo4j.com/cloud/aura/), récupère `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`.
 
-1. Crée un compte sur [cloud.qdrant.io](https://cloud.qdrant.io)
-2. Crée un cluster gratuit
-3. Récupère l'URL du cluster (`QDRANT_URL`) et la clé API (`QDRANT_API_KEY`)
+### File d'attente — Redis managé
+Ex: [Upstash](https://upstash.com), récupère `REDIS_URL`.
 
-### 3. Backend — Render
+### Backend — Render
+- New Web Service → Root Directory : `backend`
+- Build Command : `npm install && npm run build`
+- Start Command : `npm start`
+- Variables d'environnement : toutes celles listées ci-dessus, plus `QDRANT_URL` / `QDRANT_API_KEY`
 
-1. Crée un compte sur [render.com](https://render.com)
-2. New Web Service → connecte le dépôt GitHub → Root Directory : `backend`
-3. Build Command : `npm install && npm run build`
-4. Start Command : `npm start`
-5. Ajoute les variables d'environnement :
+### Frontend — Vercel
+- Root Directory : `frontend`
+- Variable : `VITE_API_URL=https://xxxxx.onrender.com/api`
 
-```
-GROQ_API_KEY=groq_xxxxx
-DATABASE_URL=postgresql://...neon.tech/rag_poc?sslmode=require
-QDRANT_URL=https://xxxxx.aws.cloud.qdrant.io
-QDRANT_API_KEY=xxxxx
-```
-
-6. Déploie → tu obtiens une URL du type `https://xxxxx.onrender.com`
-
-### 4. Frontend — Vercel
-
-1. Crée un compte sur [vercel.com](https://vercel.com)
-2. Import Project → Root Directory : `frontend`
-3. Ajoute la variable d'environnement :
+## Architecture du backend
 
 ```
-VITE_API_URL=https://xxxxx.onrender.com/api
+backend/
+└── src/
+    ├── server.ts                          # point d'entrée, démarre l'API + le worker graphe
+    │
+    ├── routes/
+    │   ├── upload.ts                      # upload PDF, embeddings, enfile l'ingestion graphe
+    │   ├── chat.ts                        # pose une question, route vers Naive ou GraphRAG
+    │   ├── sessions.ts                     # liste / recharge les conversations
+    │   └── indexingStatus.ts               # statut d'indexation graphe en temps réel
+    │
+    ├── queue/
+    │   ├── redis.ts                       # connexion Redis (BullMQ)
+    │   ├── graphQueue.ts                  # définition de la queue d'ingestion graphe
+    │   └── graphWorker.ts                 # worker qui consomme la queue et indexe dans Neo4j
+    │
+    └── services/
+        ├── db.ts                          # connexion PostgreSQL, schéma des tables
+        ├── conversationStore.ts            # historique des messages par session
+        ├── jobStore.ts                     # suivi des jobs d'indexation (statut, progression)
+        ├── pdfLoader.ts                    # extraction de texte depuis les PDF
+        ├── chunker.ts                      # découpage en chunks avec overlap
+        ├── embeddings.ts                   # génération des embeddings locaux
+        ├── llm.ts                          # appel Groq pour la génération de réponse
+        ├── groqLimiter.ts                  # rate limiting + retry/backoff pour tous les appels Groq
+        │
+        ├── vectorStore.ts                  # point d'entrée, bascule Chroma <-> Qdrant
+        ├── vectorStore.chroma.ts           # implémentation Chroma (local)
+        ├── vectorStore.qdrant.ts           # implémentation Qdrant (production)
+        │
+        └── rag/
+            ├── types.ts                    # types partagés (RagResult, RagSource, Message)
+            ├── ragEngine.ts                # point d'entrée, choisit Naive ou Graph
+            ├── naiveRag.ts                 # implémentation du RAG vectoriel classique
+            ├── graphRag.ts                 # implémentation de l'interrogation du graphe
+            ├── graphExtraction.ts           # extraction d'entités/relations via LLM (batché)
+            ├── graphSchema.ts               # validation Zod du JSON retourné par le LLM
+            ├── entityNormalization.ts       # normalisation des noms d'entités pour la fusion
+            └── graphStore.ts                # couche Neo4j (ingestion + interrogation du graphe)
 ```
 
-4. Déploie → tu obtiens une URL du type `https://xxxxx.vercel.app`
-
-## Utilisation
-
-1. Ouvre le frontend (local ou en ligne) dans ton navigateur
-2. Crée une nouvelle conversation, uploade un ou plusieurs PDF via la zone de saisie
-3. Pose tes questions dans la zone de chat
-4. Les réponses s'affichent avec les sources (documents) utilisées
-5. Retrouve et reprends une conversation passée depuis la liste dans la sidebar
-
-## Architecture du projet
+## Architecture du frontend
 
 ```
-poc-chatbot-rag/
-├── backend/
-│   ├── src/
-│   │   ├── routes/                    # Routes API (upload, chat, sessions)
-│   │   ├── services/
-│   │   │   ├── vectorStore.ts         # Point d'entrée : bascule Chroma <-> Qdrant
-│   │   │   ├── vectorStore.chroma.ts   # Implémentation Chroma (local)
-│   │   │   ├── vectorStore.qdrant.ts   # Implémentation Qdrant (production)
-│   │   │   ├── db.ts                  # Connexion PostgreSQL / Neon
-│   │   │   ├── conversationStore.ts   # Historique des messages
-│   │   │   ├── embeddings.ts
-│   │   │   ├── chunker.ts
-│   │   │   └── llm.ts
-│   │   └── server.ts
-│   └── uploads/                        # PDF uploadés (temporaire, non persistant en production)
-├── frontend/
-│   └── src/
-│       ├── api/                        # Appels au backend
-│       └── components/                 # FileUpload, ChatBox, Sidebar
+frontend/
+└── src/
+    ├── App.tsx                             # état global (session, plan, mode RAG, thème), navigation chat/billing
+    ├── api/ragApi.ts                       # client API centralisé
+    ├── hooks/useTheme.ts                   # thème clair/sombre avec persistance locale
+    ├── pages/Billing.tsx                   # page des plans tarifaires + FAQ
+    └── components/
+        ├── ChatBox.tsx                     # zone de conversation, upload, envoi de questions
+        ├── Sidebar.tsx                     # historique des conversations, documents, menu utilisateur
+        ├── UserMenu.tsx                     # profil, switch Naive/Graph, accès à la page billing
+        ├── PlanCard.tsx                     # carte de plan tarifaire
+        ├── IndexingProgress.tsx             # barre de progression de l'indexation graphe
+        ├── ThemeToggle.tsx                  # bouton clair/sombre
+        └── Icons.tsx                        # icônes SVG partagées
 ```
 
-## Test de l'API avec Postman ou cURL
+## Test de l'API
 
-### URL du backend
-
-- Local : `http://localhost:3000`
-- Production : `https://poc-chatbot-rag.onrender.com`
-
-### 1. Upload d'un ou plusieurs PDF
-
-**Endpoint**
-
-```
-POST /api/upload
-```
-
-Le body doit contenir plusieurs fichiers sous la clé `files`, ainsi qu'un champ `sessionId`.
-
-#### Exemple avec cURL
+### Upload
 
 ```bash
 curl -X POST http://localhost:3000/api/upload \
@@ -236,58 +239,25 @@ curl -X POST http://localhost:3000/api/upload \
   -F "sessionId=session-test"
 ```
 
-### 2. Poser une question au chatbot
-
-**Endpoint**
-
-```
-POST /api/chat
-```
-
-#### Exemple avec cURL
+### Question (Naive ou Graph)
 
 ```bash
 curl -X POST http://localhost:3000/api/chat \
   -H "Content-Type: application/json" \
-  -d "{\"question\":\"Quelle est la durée de la formation ?\",\"sessionId\":\"session-test\"}"
+  -d '{"question":"Quelle est la durée de la formation ?","sessionId":"session-test","ragStrategy":"graph"}'
 ```
 
-### 3. Lister les conversations
+### Statut d'indexation graphe
 
-**Endpoint**
-
-```
-GET /api/sessions
+```bash
+curl http://localhost:3000/api/indexing-status/session-test
 ```
 
-### 4. Charger une conversation précise
+### Conversations
 
-**Endpoint**
-
-```
-GET /api/sessions/:sessionId
-```
-
-### Avec Postman
-
-- **Upload**
-  - Méthode : `POST`
-  - URL : `{BASE_URL}/api/upload`
-  - Body → `form-data`
-  - Clé : `files` (type **File**, sélectionner un ou plusieurs PDF)
-  - Clé : `sessionId` (type **Text**)
-
-- **Chat**
-  - Méthode : `POST`
-  - URL : `{BASE_URL}/api/chat`
-  - Header : `Content-Type: application/json`
-  - Body → `raw` → `JSON`
-
-```json
-{
-  "question": "Quelle est la durée de la formation ?",
-  "sessionId": "session-test"
-}
+```bash
+curl http://localhost:3000/api/sessions
+curl http://localhost:3000/api/sessions/session-test
 ```
 
 ## Screenshots
@@ -297,25 +267,3 @@ GET /api/sessions/:sessionId
 ![Capture 3](Screenshots/3.png)
 ![Capture 4](Screenshots/4.png)
 ![Capture 5](Screenshots/5.png)
-![Capture 6](Screenshots/6.png)
-![Capture 7](Screenshots/7.png)
-![Capture 8](Screenshots/8.png)
-![Capture 9](Screenshots/9.png)
-![Capture 10](Screenshots/10.png)
-![Capture 11](Screenshots/11.png)
-![Capture 12](Screenshots/12.png)
-![Capture 13](Screenshots/13.png)
-![Capture 14](Screenshots/14.png)
-![Capture 15](Screenshots/15.png)
-![Capture 16](Screenshots/16.png)
-![Capture 17](Screenshots/17.png)
-![Capture 18](Screenshots/18.png)
-![Capture 19](Screenshots/19.png)
-![Capture 20](Screenshots/20.png)
-![Capture 21](Screenshots/21.png)
-![Capture 22](Screenshots/22.png)
-![Capture 23](Screenshots/23.png)
-![Capture 24](Screenshots/24.png)
-![Capture 25](Screenshots/25.png)
-![Capture 26](Screenshots/26.png)
-![Capture 27](Screenshots/27.png)
