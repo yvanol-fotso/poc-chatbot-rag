@@ -4,7 +4,7 @@ import { normalizeEntityName, pickBetterDisplayName } from "./entityNormalizatio
 
 let driver: Driver | null = null;
 
-function getDriver(): Driver {
+export function getDriver(): Driver {
   if (!driver) {
     driver = neo4j.driver(
       process.env.NEO4J_URI ?? "bolt://localhost:7687",
