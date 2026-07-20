@@ -97,6 +97,40 @@ docker run -d --name redis -p 6379:6379 redis:7-alpine
 docker run -d --name neo4j -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/motdepasse neo4j:5
 ```
 
+### 2. Services annexes (Docker recommandé)
+
+Pour simplifier l'installation, je recommande d'utiliser Docker pour lancer les services nécessaires. Aucune installation manuelle de Chroma, Redis, Neo4j ou PostgreSQL n'est alors requise : il suffit de télécharger les images Docker.
+
+```bash
+# Chroma (mode Naive)
+docker run -d --name chroma -p 8000:8000 chromadb/chroma
+
+# Redis (nécessaire au mode Graph)
+docker run -d --name redis -p 6379:6379 redis:7-alpine
+
+# Neo4j (nécessaire au mode Graph)
+docker run -d --name neo4j \
+  -p 7474:7474 \
+  -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/motdepasse \
+  neo4j:5
+
+# PostgreSQL
+docker run -d --name postgres \
+  -p 5432:5432 \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=motdepasse \
+  -e POSTGRES_DB=rag_poc \
+  postgres:16
+```
+
+Une fois les conteneurs lancés, leur état peut être vérifié avec :
+
+```bash
+docker ps
+```
+
+
 ### 3. PostgreSQL
 
 ```bash
