@@ -11,6 +11,26 @@ import {
   markFailed,
 } from "../services/jobStore";
 
+// Verrou en mémoire par sessionId : évite que deux détections de communautés
+// tournent en parallèle sur le même graphe si deux documents de la même
+// session sont uploadés coup sur coup (chaque fin de job en déclenche une).
+const communityDetectionLocks = new Map<string, Promise<void>>();
+
+function scheduleCommunityDetection(sessionId: string, filename: string) {
+  const previous = communityDetectionLocks.get(sessionId) ?? Promise.resolve();
+
+  const next = previous
+    .catch(() => {
+      // une erreur précédente ne doit pas bloquer les prochaines détections
+    })
+    .then(() => runCommunityDetection(sessionId))
+    .catch((err) =>
+      console.error(`[graph-worker] Échec de la détection de communautés pour ${filename} :`, err)
+    );
+
+  communityDetectionLocks.set(sessionId, next);
+}
+
 export function startGraphWorker() {
   const worker = new Worker<GraphIngestionJobData>(
     "graph-ingestion",
@@ -42,9 +62,8 @@ export function startGraphWorker() {
       console.log(`[graph-worker] Indexation graphe terminée : ${filename}`);
 
       // Détection de communautés en arrière-plan, ne bloque pas la réponse du job principal
-      runCommunityDetection(sessionId).catch((err) =>
-        console.error(`[graph-worker] Échec de la détection de communautés pour ${filename} :`, err)
-      );
+      // (sérialisée par session pour éviter deux exécutions concurrentes sur le même graphe)
+      scheduleCommunityDetection(sessionId, filename);
     },
     {
       connection,

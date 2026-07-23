@@ -125,6 +125,13 @@ async function summarizeCommunity(members: EntityNode[]): Promise<string> {
 /**
  * Stocke les communautés détectées (avec leurs résumés) dans Neo4j,
  * chaque communauté étant reliée à ses entités membres.
+ *
+ * Les ids de communauté donnés par Louvain ne sont pas stables d'un recalcul
+ * à l'autre (ce sont de simples index, pas des identifiants basés sur le
+ * contenu). Comme runCommunityDetection est relancé à chaque nouveau document
+ * uploadé dans la même session, on repart d'un état propre à chaque fois :
+ * sinon d'anciennes communautés / résumés périmés restent en base et peuvent
+ * se retrouver associés aux mauvaises entités au fil des recalculs.
  */
 async function storeCommunities(
   sessionId: string,
@@ -133,6 +140,12 @@ async function storeCommunities(
   const session = getDriver().session();
   try {
     await session.executeWrite(async (tx) => {
+      // Nettoyage des communautés précédentes de cette session avant réécriture
+      await tx.run(
+        `MATCH (c:Community { sessionId: $sessionId }) DETACH DELETE c`,
+        { sessionId }
+      );
+
       for (const community of communitiesWithSummary) {
         const communityKey = `${sessionId}-community-${community.id}`;
 
